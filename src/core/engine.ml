@@ -93,6 +93,7 @@ type t = {
   finished_ids : (string, unit) Hashtbl.t;
   seen : (string, unit) Hashtbl.t;
   mutable src_proc : Proc.t option;
+  src_err : Unix.file_descr;  (** stderr of the items and done_list commands *)
   intake : item Queue.t;
   mutable intake_checks : (item * Proc.t) list;
   mutable total : int;
@@ -472,7 +473,7 @@ let pump_intake t =
           Proc.read p (fun line -> arrive t (String.trim line));
           Proc.close p;
           t.src_proc <- None;
-          if rc <> 0 then t.notify (Printf.sprintf "items command exited %d" rc)));
+          if rc <> 0 then t.notify (Printf.sprintf "items command exited %d (see items.log)" rc)));
   t.intake_checks <-
     List.filter
       (fun (item, p) ->
@@ -591,8 +592,8 @@ let hosts_of (plan : Plan.t) =
   @ of_steps plan.steps
   |> List.sort_uniq compare
 
-let run_list host cmd add =
-  let p = Proc.spawn host cmd in
+let run_list ~stderr host cmd add =
+  let p = Proc.spawn ~stderr host cmd in
   let rec wait () =
     Proc.read p add;
     match Proc.poll p with
@@ -649,6 +650,7 @@ let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
       finished_ids = Hashtbl.create 1024;
       seen = Hashtbl.create 1024;
       src_proc = None;
+      src_err = (if dry then Unix.openfile "/dev/null" [ Unix.O_WRONLY; Unix.O_CLOEXEC ] 0 else Unix.openfile (Filename.concat state_dir "items.log") [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND; Unix.O_CLOEXEC ] 0o644);
       intake = Queue.create ();
       intake_checks = [];
       total = 0;
@@ -662,11 +664,11 @@ let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
   if not dry then begin
     List.iter
       (fun (where, cmd) ->
-        let rc = run_list (host_of where) cmd (fun l -> Hashtbl.replace t.finished_ids (String.trim l) ()) in
+        let rc = run_list ~stderr:t.src_err (host_of where) cmd (fun l -> Hashtbl.replace t.finished_ids (String.trim l) ()) in
         if rc <> 0 then raise (Error (Printf.sprintf "done_list command exited %d: %s" rc cmd)))
       plan.source.done_list;
     let where, cmd = plan.source.items in
-    t.src_proc <- Some (Proc.spawn (host_of where) cmd)
+    t.src_proc <- Some (Proc.spawn ~stderr:t.src_err (host_of where) cmd)
   end;
   t
 

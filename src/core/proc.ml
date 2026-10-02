@@ -32,7 +32,9 @@ let argv ~tty host script =
   | None -> [| "sh"; "-c"; script |]
   | Some h -> Array.of_list (("ssh" :: ssh_args ~tty) @ [ h; "sh -c " ^ Filename.quote script ])
 
-let spawn ?(tty = false) host script =
+(* [stderr]: where the child's stderr goes; by default it is merged with
+   stdout, which suits job logs but not commands whose stdout is data. *)
+let spawn ?(tty = false) ?stderr host script =
   let argv = argv ~tty host script in
   let r, w = Unix.pipe ~cloexec:true () in
   let devnull = Unix.openfile "/dev/null" [ Unix.O_RDONLY; Unix.O_CLOEXEC ] 0 in
@@ -43,7 +45,7 @@ let spawn ?(tty = false) host script =
         Sys.set_signal Sys.sigpipe Sys.Signal_default;
         Unix.dup2 devnull Unix.stdin;
         Unix.dup2 w Unix.stdout;
-        Unix.dup2 w Unix.stderr;
+        Unix.dup2 (Option.value stderr ~default:w) Unix.stderr;
         Unix.execvp argv.(0) argv
       with
       | _ -> Unix._exit 127)
