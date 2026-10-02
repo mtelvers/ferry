@@ -1,4 +1,16 @@
+; The .cmi files a pipeline script needs (the stdlib and the Ferry API),
+; embedded so that the toplevel works with no OCaml installation.
+(rule
+ (targets cmis.ml)
+ (deps
+  (glob_files %{ocaml_where}/*.cmi)
+  %{cmi:../src/ferry/ferry})
+ (action
+  (run %{exe:../gen/embed.exe} %{targets} %{deps})))
+
 (executable
  (public_name ferry)
  (name main)
- (libraries notty notty.unix unix cmdliner))
+ (modes byte_complete)
+ (link_flags (-linkall))
+ (libraries ferry ferry_core compiler-libs.toplevel notty notty.unix unix cmdliner))

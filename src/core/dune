@@ -1,0 +1,3 @@
+(library
+ (name ferry_core)
+ (libraries unix notty notty.unix))

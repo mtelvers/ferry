@@ -128,13 +128,18 @@ let close t =
 
 (* Some exit code if the process has finished. *)
 let poll t =
+  if t.pid <= 0 then Some 255 else
   match Unix.waitpid [ Unix.WNOHANG ] t.pid with
   | 0, _ -> None
   | _, Unix.WEXITED n -> Some n
   | _, (Unix.WSIGNALED n | Unix.WSTOPPED n) -> Some (128 + abs n)
   | exception Unix.Unix_error (Unix.ECHILD, _, _) -> Some 255
 
-let kill ?(signal = Sys.sigterm) t = try Unix.kill (-t.pid) signal with Unix.Unix_error _ -> ()
+(* never signal pid 0: kill(-0) would hit our own process group *)
+let kill ?(signal = Sys.sigterm) t = if t.pid > 0 then try Unix.kill (-t.pid) signal with Unix.Unix_error _ -> ()
+
+(* stands in for a job that never started *)
+let dummy () = { pid = 0; fd = Unix.stdin; partial = Buffer.create 0; open_ = false; closed = true }
 
 (* Run to completion, returning the exit code (for probes at startup). *)
 let run_sync host script =

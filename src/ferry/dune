@@ -1,0 +1,3 @@
+(library
+ (name ferry)
+ (libraries ferry_core))
