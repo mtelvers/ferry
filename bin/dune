@@ -1,0 +1,4 @@
+(executable
+ (public_name ferry)
+ (name main)
+ (libraries notty notty.unix unix cmdliner))
