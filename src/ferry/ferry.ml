@@ -2,16 +2,19 @@ open Ferry_core.Plan
 
 type host = where
 
-let host ?(vars = []) name = At { name; vars }
+let host name = At name
 let local = Local
-let here = Here
+
+type nonrec item = item
+
+let id (i : item) = i.id
+let out (i : item) = match i.out with Some o -> o | None -> invalid_arg "Ferry.out: only in the command of an ~atomic stage"
+let prop (i : item) name = Hashtbl.find_opt i.props name
 
 type pipeline = step list
 
 let opts ?(jobs = 1) ?(retries = 2) ?(checks = 4) () = { jobs = max 0 jobs; retries = max 0 retries; checks = max 1 checks }
-
 let shell ?jobs ?retries ?checks ?skip ?atomic name where cmd = [ Shell { name; where; cmd; skip; atomic; opts = opts ?jobs ?retries ?checks () } ]
-
 let copy ?jobs ?retries ?checks ?skip name src dst = [ Copy { name; src; dst; move = false; skip; opts = opts ?jobs ?retries ?checks () } ]
 let move ?jobs ?retries ?checks ?skip name src dst = [ Copy { name; src; dst; move = true; skip; opts = opts ?jobs ?retries ?checks () } ]
 let ( >>> ) a b = a @ b
@@ -29,4 +32,4 @@ let done_if ?(on = Local) cmd src =
 
 let run source steps =
   if !registered <> None then invalid_arg "Ferry.run: called more than once";
-  registered := Some { source; steps; syntax = Env }
+  registered := Some { source; steps }

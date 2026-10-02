@@ -23,50 +23,54 @@ ferry --fresh PIPELINE.ml   # ignore the journal from earlier runs
 ```ocaml
 open Ferry
 
-let builder = host "builder.example.org"
-let gpu1 = host "gpu1.example.org" ~vars:[ ("SCRATCH", "/scratch/work"); ("CHUNK", "1024") ]
-let gpu2 = host "gpu2.example.org" ~vars:[ ("SCRATCH", "/data/work"); ("CHUNK", "64") ]
+let sprintf = Printf.sprintf
 
-let build = shell "build" builder ~jobs:4 "cd ~/work && python3 build_tile.py $ID 2017 /data/work/$ID"
-let fetch gpu = move "fetch" (builder, "/data/work/$ID/") (gpu, "$SCRATCH/$ID/")
-let encode gpu = shell "encode" gpu ~atomic:"$SCRATCH/out/$ID" "TC_CHUNK=$CHUNK encode $SCRATCH/$ID $OUT"
-let store = move "store" (here, "$SCRATCH/out/$ID/") (gpu1, "~/v2/2017/$ID/")
+type gpu = { host : host; scratch : string; chunk : int }
+
+let builder = host "builder.example.org"
+let gpu1 = host "gpu1.example.org"
+let gpus = [ { host = gpu1; scratch = "/scratch/work"; chunk = 1024 };
+             { host = host "gpu2.example.org"; scratch = "/data/work"; chunk = 64 } ]
+
+let build = shell "build" builder ~jobs:4 (fun i -> sprintf "python3 build_tile.py %s /data/%s" (id i) (id i))
+let fetch g = move "fetch" (builder, fun i -> sprintf "/data/%s/" (id i)) (g.host, fun i -> sprintf "%s/%s/" g.scratch (id i))
+
+let encode g =
+  shell "encode" g.host
+    ~atomic:(fun i -> sprintf "%s/out/%s" g.scratch (id i))
+    (fun i -> sprintf "TC_CHUNK=%d encode %s/%s %s" g.chunk g.scratch (id i) (out i))
+
+let store g = move "store" (g.host, fun i -> sprintf "%s/out/%s/" g.scratch (id i)) (gpu1, fun i -> sprintf "~/v2/2017/%s/" (id i))
 
 let () =
   run
     (items ~on:builder "cat ~/work/missing.txt"
-     |> done_if ~on:gpu1 "test -f ~/v2/2017/$ID/$ID.npy")
-    (build
-     >>> either ~capacity:8 (List.map (fun g -> fetch g >>> encode g) [ gpu1; gpu2 ])
-     >>> store)
+     |> done_if ~on:gpu1 (fun i -> sprintf "test -f ~/v2/2017/%s/%s.npy" (id i) (id i)))
+    (build >>> either ~capacity:8 (List.map (fun g -> fetch g >>> encode g >>> store g) gpus))
 ```
 
-**Commands** are shell, run with `sh -c` on their host. They see the item's
-values as environment variables:
+**Commands are functions of the item** (`item -> string`), run with
+`sh -c` on their host. Anything that differs per host is an ordinary OCaml
+value the function closes over, such as the `gpu` record above, so it's
+type-checked. The item gives you:
 
-- `$ID`: the item;
-- `$HERE`: the host it last ran on;
-- `$OUT`: the temporary output directory of an `~atomic` stage;
-- the `~vars` of the host the command runs on;
-- anything an earlier stage set by printing `ferry-set NAME=VALUE`.
+- `id i`: the item's ID;
+- `out i`: in an `~atomic` stage's command, the temporary output directory;
+- `prop i "name"`: a value an earlier stage set by printing `ferry-set name=value`.
 
-Values that are the same for every item are just OCaml: build the command
-with `^` or `Printf.sprintf`. ferry adds an `export` line before each
-command, so the usual shell rules apply: `$ID` expands inside double quotes
-and not inside single quotes, and `awk '{print $2}'` is untouched.
+A function can raise `Failure`; that fails the job, with the message as its log.
 
 | | |
 |---|---|
-| `shell name host cmd` | run `cmd` per item on `host`. `~jobs` (default 1), `~retries` (2), `~skip` (a check on the same host: exit 0 = already done), `~atomic:dir` (write to `$OUT`, moved to `dir` on success) |
-| `copy name (h1, src) (h2, dst)` | rsync, run on whichever host can reach the other. A destination containing `$ID` is filled under a temporary name and renamed into place |
+| `shell name host cmd` | run `cmd i` per item on `host`. `~jobs` (default 1), `~retries` (2), `~skip` (a check on the same host: exit 0 = already done), `~atomic` (a directory: write to `out i`, moved there on success) |
+| `copy name (h1, src) (h2, dst)` | rsync, run on whichever host can reach the other. A destination whose last component contains the ID is filled under a temporary name and renamed into place. `~skip:(host, check)` names the host its check runs on |
 | `move ...` | copy, then delete the source |
-| `here` | the host the item last ran on (or was copied to) |
 | `a >>> b` | one after the other |
-| `either ~capacity:n [a; b]` | each item takes one branch: the least loaded one with room whose first stage has a free slot. At most `n` items inside a branch. Branches rejoin afterwards |
+| `either ~capacity:n [a; b]` | each item takes one branch: the least loaded one with room whose first stage has a free slot. At most `n` items inside a branch. Branches rejoin afterwards, so anything that depends on the branch belongs inside it |
 | `limit n p` | at most `n` items inside `p` |
 | `items ~on cmd` | a command printing one ID per line |
 | `done_list ~on cmd` | run once at startup: IDs printed are finished and skip the pipeline |
-| `done_if ~on cmd` | run per new item: exit 0 means finished, so it skips the pipeline |
+| `done_if ~on check` | run per new item: exit 0 means finished, so it skips the pipeline |
 
 ## Behaviour
 
@@ -75,8 +79,8 @@ and not inside single quotes, and `awk '{print $2}'` is untouched.
   stopped, on the same branch. `done_list`/`done_if` cover work done outside
   ferry. Between them, per-stage `~skip` checks are rarely needed.
 - **Pools balance themselves.** `either` sends each item to a branch with
-  room, so a faster GPU takes more items. Each pooled stage appears in the
-  TUI per host (`encode@gpu1`, `encode@gpu2`) and can be paused alone.
+  room, so a faster GPU takes more items. Stages repeated across branches are
+  named by host (`encode@gpu1`, `encode@gpu2`) and can be paused alone.
 - **Stopping stops everything.** `q` in the TUI, or SIGINT/SIGTERM/SIGHUP, ends
   every job. Each job runs in its own process group, and remote commands run
   under `ssh -tt`, so they get SIGHUP when their ssh dies.
@@ -101,7 +105,8 @@ and not inside single quotes, and `awk '{print $2}'` is untouched.
 ## The line format
 
 For a straight pipeline you can skip OCaml. A file not ending in `.ml` is read
-as one stage per block, using `{id}`-style templates:
+as one stage per block, using `{id}` templates (`{out}` in atomic stages, and
+properties by name). A copy's `skip:` runs on its destination host:
 
 ```
 set P = builder.example.org

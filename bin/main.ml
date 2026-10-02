@@ -91,7 +91,7 @@ let dry_run (eng : Engine.t) =
           Printf.printf "\n%s== %s  jobs=%d retries=%d\n" pad w.key w.jobs w.opts.retries;
           Option.iter (show "skip") skip;
           show "run" run)
-    (Engine.describe eng (match eng.syntax with Plan.Braces -> "{id}" | Plan.Env -> "<id>"))
+    (Engine.describe eng "<id>")
 
 let run_tui eng ui =
   let term = Term.create () in
@@ -158,7 +158,7 @@ let main path state_dir fresh no_tui dry =
       2
   | Ok plan -> (
       List.iter (fun s -> Sys.set_signal s (Sys.Signal_handle (fun _ -> stop_requested := true))) [ Sys.sigterm; Sys.sighup; Sys.sigint ];
-      let hosts = match Engine.hosts_of plan with tbl -> Hashtbl.fold (fun h _ acc -> h :: acc) tbl [] |> List.sort compare | exception Engine.Error e -> prerr_endline e; exit 2 in
+      let hosts = Engine.hosts_of plan in
       check_hosts hosts;
       probe_routes hosts;
       let state_dir = Option.value state_dir ~default:(path ^ ".state") in

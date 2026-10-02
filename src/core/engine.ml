@@ -9,11 +9,10 @@
    stage's - is where items wait. With several branches, the item goes to the
    least loaded one, so faster branches take more items.
 
-   Items carry properties ({id}, {here} and whatever stages set with
-   "ferry-set key=value" output lines), used in command templates along with
-   the variables of the host a command runs on. Completed stages are
-   journalled with the item's properties, so a restart resumes each item at
-   the same place - on the same branch. *)
+   Commands, skip checks and paths are functions of the item (its ID, and
+   properties set by earlier stages printing "ferry-set NAME=VALUE").
+   Completed stages are journalled with the item's properties, so a restart
+   resumes each item at the same place - on the same branch. *)
 
 open Plan
 
@@ -88,8 +87,6 @@ type t = {
   works : work array;
   entry : node;
   source : Plan.source;
-  syntax : Plan.syntax;
-  hosts : (string, (string * string) list) Hashtbl.t;
   reach : string -> string -> bool;
   journal : out_channel;
   resume : (string, string * (string * string) list) Hashtbl.t;
@@ -172,7 +169,7 @@ let rec rows_of node acc =
   | Gate g -> rows_of g.after (Array.fold_left (fun acc e -> rows_of e acc) (Row_gate g :: acc) g.entries)
   | Exit _ | Finish -> acc
 
-let where_label = function Local -> "local" | At h -> short h.name | Here -> "here"
+let where_label = function Local -> "local" | At h -> short h
 
 let work_label w =
   match w.step with
@@ -182,95 +179,14 @@ let work_label w =
 
 let branch_label = function Work w -> work_label w | Gate _ -> "gate" | Exit _ | Finish -> "-"
 
-(* ---- templates and scripts ---- *)
+(* ---- calling the item functions ---- *)
 
-(* The per-item values a command can use: the host's variables, then the
-   item's properties (which win). In the environment syntax, id and here are
-   ID and HERE. *)
-let values t item host =
-  let vars = match host with Some h -> Option.value ~default:[] (Hashtbl.find_opt t.hosts h) | None -> [] in
-  let props = Hashtbl.fold (fun k v acc -> (k, v) :: acc) item.props [] |> List.sort compare in
-  let rename k = match (t.syntax, k) with Env, "id" -> "ID" | Env, "here" -> "HERE" | _ -> k in
-  vars @ List.map (fun (k, v) -> (rename k, v)) props
+let host_of = function At h -> Some h | Local -> None
 
-let lookup values name = List.assoc_opt name (List.rev values)
+let view ?out item = { Plan.id = item.id; props = item.props; out }
 
-let is_ident s = s <> "" && Spec.is_ident_start s.[0] && String.for_all Spec.is_ident s
-
-(* $NAME and ${NAME} for the names we know; anything else is left for the shell *)
-let expand_dollars f s =
-  let b = Buffer.create (String.length s) in
-  let n = String.length s in
-  let rec go i =
-    if i >= n then ()
-    else if s.[i] = '$' && i + 1 < n && s.[i + 1] = '{' then begin
-      match String.index_from_opt s (i + 2) '}' with
-      | Some j when is_ident (String.sub s (i + 2) (j - i - 2)) && f (String.sub s (i + 2) (j - i - 2)) <> None ->
-          Buffer.add_string b (Option.get (f (String.sub s (i + 2) (j - i - 2))));
-          go (j + 1)
-      | _ ->
-          Buffer.add_char b '$';
-          go (i + 1)
-    end
-    else if s.[i] = '$' && i + 1 < n && Spec.is_ident_start s.[i + 1] then begin
-      let j = ref (i + 1) in
-      while !j < n && Spec.is_ident s.[!j] do
-        incr j
-      done;
-      let name = String.sub s (i + 1) (!j - i - 1) in
-      (match f name with Some v -> Buffer.add_string b v | None -> Buffer.add_string b (String.sub s i (!j - i)));
-      go !j
-    end
-    else begin
-      Buffer.add_char b s.[i];
-      go (i + 1)
-    end
-  in
-  go 0;
-  Buffer.contents b
-
-(* Fill in per-item values. Braces: every {name} must be known. Env: only
-   used for paths ferry builds commands from; commands themselves get the
-   values as environment variables instead (see [exports]). *)
-let expand t item host s =
-  let values = values t item host in
-  match t.syntax with
-  | Env -> Ok (expand_dollars (lookup values) s)
-  | Braces -> (
-      let missing = ref [] in
-      let r =
-        Spec.subst
-          (fun name ->
-            match lookup values name with
-            | Some v -> Some v
-            | None ->
-                missing := name :: !missing;
-                None)
-          s
-      in
-      match !missing with [] -> Ok r | m -> Error ("unknown variable " ^ String.concat ", " (List.map (fun n -> "{" ^ n ^ "}") m)))
-
-(* "export ID='...' HERE='...' CHUNK='...'" for the environment syntax *)
-let exports t item host extra =
-  let vs = values t item host @ extra |> List.filter (fun (k, _) -> is_ident k) in
-  (* last binding of each name wins *)
-  let vs = List.fold_left (fun acc (k, v) -> (k, v) :: List.remove_assoc k acc) [] vs |> List.rev in
-  "export " ^ String.concat " " (List.map (fun (k, v) -> k ^ "=" ^ Filename.quote v) vs) ^ "\n"
-
-(* does this path differ per item? *)
-let mentions_id t s =
-  match t.syntax with
-  | Braces -> Spec.subst (function "id" -> Some "" | _ -> None) s <> s
-  | Env -> expand_dollars (function "ID" -> Some "" | _ -> None) s <> s
-
-let resolve_where item = function
-  | Local -> Ok None
-  | At h -> Ok (Some h.name)
-  | Here -> (
-      match Hashtbl.find_opt item.props "here" with
-      | Some "" -> Ok None
-      | Some h -> Ok (Some h)
-      | None -> Error "here is not set: the item has not run anywhere yet")
+(* A user function can raise; that fails the job, with the reason as its log. *)
+let call f v = try Ok (f v) with Failure m | Invalid_argument m -> Error m | e -> Error (Printexc.to_string e)
 
 let remote host path = match host with None -> path | Some h -> h ^ ":" ^ path
 
@@ -311,39 +227,38 @@ let copy_script t ~key ~move ~per_item (sh, sp) (dh, dp) =
     | Some a, Some b -> if t.reach b a then pull dh else if t.reach a b then push sh else Error (Printf.sprintf "neither %s nor %s can ssh to the other" a b)
     | None, None -> assert false
 
-let skip_of w = match w.step with Shell { skip; _ } | Copy { skip; _ } -> skip | Gate _ -> None
+let has_skip w = match w.step with Shell { skip = Some _; _ } | Copy { skip = Some _; _ } -> true | _ -> false
 
-(* For one item: (host to run on, script, host the item ends up on). *)
+(* A destination is per item - safe to fill under a temporary name and
+   rename into place - when its last component contains the item's ID. *)
+let per_item item dp =
+  let base = Filename.basename (strip_slash dp) in
+  let n = String.length item.id in
+  let rec has i = i + n <= String.length base && (String.sub base i n = item.id || has (i + 1)) in
+  n > 0 && has 0
+
+(* For one item: the host to run on, and the script. *)
 let script t w item kind =
-  let* runner, run, dest, out =
-    match w.step with
-    | Shell { where; cmd; atomic; _ } ->
-        let* runner = resolve_where item where in
-        let* run, out =
-          match atomic with
-          | None -> Ok (cmd, [])
-          | Some dir ->
-              let* dir = expand t item runner dir in
-              let tmp = Printf.sprintf "%s/.ferry-%s-%s" (parent dir) w.key item.id in
-              let cmd = match t.syntax with Braces -> Spec.subst (function "out" -> Some tmp | _ -> None) cmd | Env -> cmd in
-              Ok (Printf.sprintf "rm -rf %s && mkdir -p %s && (\n%s\n) && mkdir -p %s && mv %s/* %s/ && rmdir %s" tmp tmp cmd dir tmp dir tmp, [ ("OUT", tmp) ])
-        in
-        Ok (runner, run, runner, out)
-    | Copy { src = sw, sp; dst = dw, dp; move; _ } ->
-        let* sh = resolve_where item sw in
-        let* dh = resolve_where item dw in
-        let* sp = expand t item sh sp in
-        let* dp' = expand t item dh dp in
-        let* runner, run = copy_script t ~key:w.key ~move ~per_item:(mentions_id t dp) (sh, sp) (dh, dp') in
-        Ok (runner, run, dh, [])
-    | Gate _ -> assert false
-  in
-  let s = match (kind, skip_of w) with Check, Some skip -> skip | _ -> run in
-  match t.syntax with
-  | Braces ->
-      let* s = expand t item runner s in
-      Ok (runner, s, dest)
-  | Env -> Ok (runner, exports t item runner out ^ s, dest)
+  match (w.step, kind) with
+  | Shell { where; skip = Some skip; _ }, Check ->
+      let* s = call skip (view item) in
+      Ok (host_of where, s)
+  | Copy { skip = Some (where, skip); _ }, Check ->
+      let* s = call skip (view item) in
+      Ok (host_of where, s)
+  | Shell { where; cmd; atomic = None; _ }, _ ->
+      let* s = call cmd (view item) in
+      Ok (host_of where, s)
+  | Shell { where; cmd; atomic = Some dir; _ }, _ ->
+      let* dir = call dir (view item) in
+      let tmp = Printf.sprintf "%s/.ferry-%s-%s" (parent dir) w.key item.id in
+      let* cmd = call cmd (view ~out:tmp item) in
+      Ok (host_of where, Printf.sprintf "rm -rf %s && mkdir -p %s && (\n%s\n) && mkdir -p %s && mv %s/* %s/ && rmdir %s" tmp tmp cmd dir tmp dir tmp)
+  | Copy { src = sw, sp; dst = dw, dp; move; _ }, _ ->
+      let* sp = call sp (view item) in
+      let* dp = call dp (view item) in
+      copy_script t ~key:w.key ~move ~per_item:(per_item item dp) (host_of sw, sp) (host_of dw, dp)
+  | Gate _, _ -> assert false
 
 (* ---- journal ---- *)
 
@@ -419,7 +334,7 @@ let spawn t w item kind =
       w.failed <- job :: List.filter (fun j -> j.item.id <> item.id) w.failed;
       release item;
       t.notify (Printf.sprintf "%s %s: %s" w.key item.id msg)
-  | Ok (runner, script, _) -> (
+  | Ok (runner, script) -> (
       let tty = match kind with Check -> false | Run _ -> true in
       let job = { work = w; item; kind; proc = Proc.spawn ~tty runner script; started = Unix.gettimeofday (); log = Queue.create (); finished = None; cancelled = false } in
       match kind with Check -> w.checking <- job :: w.checking | Run _ -> w.running <- w.running @ [ job ])
@@ -441,7 +356,7 @@ let schedule t =
             end
           done
       | Row_work w ->
-          if skip_of w <> None then
+          if has_skip w then
             while List.length w.checking < w.opts.checks && not (Queue.is_empty w.input) do
               spawn t w (Queue.pop w.input) Check
             done
@@ -477,9 +392,7 @@ let finish t job rc =
   Proc.close job.proc;
   job.finished <- Some (now, rc);
   let item = job.item in
-  (* record where the item now is, then journal it, then pass it on *)
   let moved_on status =
-    (match script t w item (Run 1) with Ok (_, _, dest) -> Hashtbl.replace item.props "here" (Option.value ~default:"" dest) | Error _ -> ());
     journal t w status item;
     forward t w.next item
   in
@@ -548,8 +461,6 @@ let arrive t id =
       if t.source.done_if <> None && journalled = None then Queue.push item t.intake else admit t item
   end
 
-let host_of = function At h -> Some h.name | Local | Here -> None
-
 let pump_intake t =
   (match t.src_proc with
   | None -> ()
@@ -578,10 +489,8 @@ let pump_intake t =
   | Some (where, cmd) ->
       while List.length t.intake_checks < intake_checks && not (Queue.is_empty t.intake) do
         let item = Queue.pop t.intake in
-        let host = host_of where in
-        let cmd = match t.syntax with Env -> Ok (exports t item host [] ^ cmd) | Braces -> expand t item host cmd in
-        match cmd with
-        | Ok s -> t.intake_checks <- (item, Proc.spawn host s) :: t.intake_checks
+        match call cmd (view item) with
+        | Ok s -> t.intake_checks <- (item, Proc.spawn (host_of where) s) :: t.intake_checks
         | Error msg ->
             t.notify ("done_if: " ^ msg);
             admit t item
@@ -667,30 +576,20 @@ let retry_at t w item = List.find_map (fun (at, w', i) -> if w' == w && i == ite
 (* ---- creation ---- *)
 
 let hosts_of (plan : Plan.t) =
-  let of_where = function At h -> [ h ] | Local | Here -> [] in
+  let of_where = function At h -> [ h ] | Local -> [] in
   let rec of_steps steps =
     List.concat_map
       (function
         | Shell { where; _ } -> of_where where
-        | Copy { src = sw, _; dst = dw, _; _ } -> of_where sw @ of_where dw
+        | Copy { src = sw, _; dst = dw, _; skip; _ } -> of_where sw @ of_where dw @ (match skip with Some (w, _) -> of_where w | None -> [])
         | Gate { branches; _ } -> List.concat_map of_steps branches)
       steps
   in
-  let all =
-    of_where (fst plan.source.items)
-    @ List.concat_map (fun (w, _) -> of_where w) plan.source.done_list
-    @ (match plan.source.done_if with Some (w, _) -> of_where w | None -> [])
-    @ of_steps plan.steps
-  in
-  let tbl = Hashtbl.create 8 in
-  List.iter
-    (fun (h : host) ->
-      match Hashtbl.find_opt tbl h.name with
-      | Some vars when h.vars <> [] && vars <> [] && vars <> h.vars -> raise (Error (Printf.sprintf "host %s is given different vars in different places" h.name))
-      | Some vars when vars <> [] -> ()
-      | _ -> Hashtbl.replace tbl h.name h.vars)
-    all;
-  tbl
+  of_where (fst plan.source.items)
+  @ List.concat_map (fun (w, _) -> of_where w) plan.source.done_list
+  @ (match plan.source.done_if with Some (w, _) -> of_where w | None -> [])
+  @ of_steps plan.steps
+  |> List.sort_uniq compare
 
 let run_list host cmd add =
   let p = Proc.spawn host cmd in
@@ -708,17 +607,28 @@ let run_list host cmd add =
   wait ()
 
 let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
-  if fst plan.source.items = Here then raise (Error "items cannot run on here");
-  let hosts = hosts_of plan in
   let entry = chain plan.steps ~depth:0 ~enclosing:[] ~next:Finish in
   let rows = List.rev (rows_of entry []) in
   let works = List.filter_map (function Row_work w -> Some w | Row_gate _ -> None) rows |> Array.of_list in
   if works = [||] then raise (Error "the pipeline has no stages");
-  (* journal keys must be unique: repeated names get their host appended -
-     for a copy, the host the item ends up on. Keys appear in file names. *)
-  let suffix w = match w.step with Copy { dst = dw, _; _ } -> where_label dw | _ -> work_label w in
+  (* journal keys must be unique: stages sharing a name get a host suffix -
+     for a copy, the destination, else the source, else both, whichever
+     tells them apart. Keys appear in file names. *)
+  let label_by pick w =
+    match w.step with
+    | Copy { src = sw, _; dst = dw, _; _ } -> (
+        match pick with `Dst -> where_label dw | `Src -> where_label sw | `Both -> where_label sw ^ "-" ^ where_label dw)
+    | _ -> work_label w
+  in
   let safe = String.map (function ('A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' | '-' | '.' | '@') as c -> c | _ -> '_') in
-  Array.iter (fun w -> if Array.exists (fun w' -> w' != w && w'.name = w.name) works then w.key <- w.name ^ "@" ^ suffix w) works;
+  Array.iter
+    (fun w ->
+      let group = Array.to_list works |> List.filter (fun w' -> w'.name = w.name) in
+      if List.length group > 1 then
+        let distinct pick = List.length (List.sort_uniq compare (List.map (label_by pick) group)) = List.length group in
+        let pick = List.find_opt distinct [ `Dst; `Src; `Both ] |> Option.value ~default:`Both in
+        w.key <- w.name ^ "@" ^ label_by pick w)
+    works;
   Array.iter (fun w -> w.key <- safe w.key) works;
   Array.iter
     (fun w -> if Array.exists (fun w' -> w' != w && w'.key = w.key) works then raise (Error (Printf.sprintf "two stages are both called %s; give them different names" w.key)))
@@ -733,8 +643,6 @@ let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
       works;
       entry;
       source = plan.source;
-      syntax = plan.syntax;
-      hosts;
       reach;
       journal = (if dry then open_out "/dev/null" else open_append journal_path);
       resume = (if dry then Hashtbl.create 1 else load_journal journal_path);
@@ -768,10 +676,5 @@ let describe t id =
   List.map
     (function
       | Row_gate g -> `Gate g
-      | Row_work w ->
-          let show kind = Result.map (fun (r, s, _) -> (r, s)) (script t w item kind) in
-          let r = `Work (w, show (Run 1), if skip_of w <> None then Some (show Check) else None) in
-          (* carry {here} on, as a real item would *)
-          (match script t w item (Run 1) with Ok (_, _, dest) -> Hashtbl.replace item.props "here" (Option.value ~default:"" dest) | Error _ -> ());
-          r)
+      | Row_work w -> `Work (w, script t w item (Run 1), if has_skip w then Some (script t w item Check) else None))
     t.rows
