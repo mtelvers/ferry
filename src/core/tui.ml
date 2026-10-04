@@ -61,7 +61,7 @@ let stage_row (t : Engine.t) ui k r =
       row ~attr [ indent g.gdepth ^ gate_name g; gate_load g; ""; string_of_int (Queue.length g.queue); ""; ""; ""; ""; "" ]
   | Engine.Row_work w ->
       let running = List.length w.running in
-      let waiting = Queue.length w.input + Queue.length w.ready + List.length w.checking + w.retrying in
+      let waiting = Queue.length w.input + w.retrying in
       let cells =
         [
           indent w.depth ^ w.name;
@@ -89,7 +89,7 @@ let job_line (t : Engine.t) (j : Engine.job) w selected focused =
         | Some retry when List.memq j j.work.awaiting -> ("↻", yellow, Printf.sprintf "exit %d, retry in %s" rc (duration (Float.max 0. (retry -. now))))
         | _ -> ("✗", red, Printf.sprintf "exit %d %s" rc (duration (at -. j.started))))
   in
-  let attempt = match j.kind with Engine.Run n when n > 1 -> Printf.sprintf " #%d" n | _ -> "" in
+  let attempt = if j.attempt > 1 then Printf.sprintf " #%d" j.attempt else "" in
   let tw = String.length time + 1 in
   let hl = if not selected then A.empty else if focused then sel else A.st A.underline in
   I.string A.(attr ++ hl) (glyph ^ " ") <|> text ~attr:hl (w - 2 - tw) (j.item.id ^ attempt) <|> rtext ~attr:hl tw time

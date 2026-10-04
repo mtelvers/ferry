@@ -1,32 +1,52 @@
 (** Pipelines of shell commands across ssh hosts.
 
-    A pipeline script is an ordinary OCaml file that ends by calling {!run}.
-    Commands are functions of the item, so anything that differs per host -
-    paths, settings - is just an OCaml value the function closes over:
+    A pipeline script is an ordinary OCaml file: a stream of item IDs piped
+    through stages, ending in {!run}.
 
     {[
       open Ferry
 
-      let sprintf = Printf.sprintf
-
       type gpu = { host : host; scratch : string; chunk : int }
 
       let builder = host "builder.example.org"
-      let gpus = [ { host = host "gpu1.example.org"; scratch = "/scratch/work"; chunk = 1024 };
+      let gpu1 = host "gpu1.example.org"
+      let gpus = [ { host = gpu1; scratch = "/scratch/work"; chunk = 1024 };
                    { host = host "gpu2.example.org"; scratch = "/data/work"; chunk = 64 } ]
 
-      let build = shell "build" builder ~jobs:4 (fun i -> sprintf "python3 build_tile.py %s /data/%s" (id i) (id i))
-      let fetch g = move "fetch" (builder, fun i -> sprintf "/data/%s/" (id i)) (g.host, fun i -> sprintf "%s/%s/" g.scratch (id i))
-      let encode g = shell "encode" g.host (fun i -> sprintf "TC_CHUNK=%d encode %s/%s" g.chunk g.scratch (id i))
+      let build = stage "build" builder ~jobs:4 ~out:"/data/{id}/" "python3 build_tile.py {id} {out}"
 
-      let () =
-        run
-          (items ~on:builder "cat tiles.txt")
-          (build >>> either ~capacity:8 (List.map (fun g -> fetch g >>> encode g) gpus))
+      let gpu g =
+        limit 8
+          (move "fetch" (at g.host (g.scratch ^ "/{id}/"))
+           >>> stage "encode" g.host ~consume:true ~out:(g.scratch ^ "/out/{id}/")
+                 (sprintf "TC_CHUNK=%d encode %s/{id} {out}" g.chunk g.scratch)
+           >>> move "store" (at gpu1 "~/v2/{id}/"))
+
+      let () = items builder "cat tiles.txt" |> build |> either (List.map gpu gpus) |> run
     ]}
 
-    Commands are run with [sh -c] on their host. A function may raise
-    [Failure]; that fails the job, with the message as its log. *)
+    Every string is a template: [{id}] is the item's ID, [{out}] the
+    temporary output directory (see {!stage}), and [{NAME}] a property an
+    earlier stage set by printing a line [ferry-set NAME=VALUE]. Commands
+    run with [sh -c] on their host.
+
+    {2 Declared outputs}
+
+    A stage that declares [~out] says what it produces for an item, as a path
+    on its host; a trailing slash means a directory. From that, ferry derives
+    what the script would otherwise spell out:
+
+    - {b Resume.} At startup each output is listed once, and an item starts
+      after the furthest stage whose output exists. Work done outside ferry,
+      or before a crash, is never repeated.
+    - {b Atomic results.} A command that mentions [{out}] writes into a
+      temporary directory; only if it succeeds is the result moved into
+      place: a directory output is renamed into position, and the contents
+      of [{out}] go into a file output's directory.
+    - {b Copies.} {!copy} and {!move} take only a destination: the source is
+      the previous output.
+    - {b Cleanup.} [~consume:true] deletes the previous output once the stage
+      has succeeded. *)
 
 type host
 (** Where commands run. *)
@@ -37,68 +57,62 @@ val host : string -> host
 val local : host
 (** The machine running ferry. *)
 
-type item
-(** One item, as seen by a command function. *)
-
-val id : item -> string
-(** The item's ID, as printed by the {!items} command. *)
-
-val out : item -> string
-(** In the command of an [~atomic] stage: the temporary directory to write
-    the output to. Raises [Invalid_argument] anywhere else. *)
-
-val prop : item -> string -> string option
-(** A property an earlier stage set by printing a line [ferry-set NAME=VALUE]. *)
-
 type pipeline
-(** Stages joined with {!(>>>)}. *)
+(** A stream of items and the stages it has passed through so far. *)
 
-val shell : ?jobs:int -> ?retries:int -> ?checks:int -> ?skip:(item -> string) -> ?atomic:(item -> string) -> string -> host -> (item -> string) -> pipeline
-(** [shell name host cmd] runs [cmd item] on [host] for each item.
+type stage = pipeline -> pipeline
+(** One step of a pipeline; chain them with [|>] or {!(>>>)}. *)
+
+val items : host -> string -> pipeline
+(** [items host cmd]: a command printing one item ID per line. *)
+
+val stage : ?jobs:int -> ?retries:int -> ?out:string -> ?ls:string -> ?consume:bool -> string -> host -> string -> stage
+(** [stage name host cmd] runs [cmd] on [host] for each item.
     - [jobs]: how many at once (default 1).
     - [retries]: retries after a failure, with backoff (default 2).
-    - [skip]: a command run first on the same host; exit 0 means this stage
-      is already done for the item.
-    - [atomic]: a directory; [cmd] writes its output to [out item], which is
-      moved into the directory only if [cmd] succeeds. *)
+    - [out]: the output path for an item (a trailing slash: a directory).
+      It must mention [{id}]: an output shared between items could not be
+      listed, would be replaced by each item and deleted by the first
+      [consume]. When [cmd] mentions [{out}], it must write there; ferry
+      moves the result into place only on success.
+    - [ls]: a command, run once at startup on [host], printing the IDs whose
+      output already exists. Needed only when the output is not a local path
+      - on S3, say. For a path mentioning [{id}] it is derived.
+    - [consume]: delete the previous output once this stage succeeds.
 
-val copy :
-  ?jobs:int -> ?retries:int -> ?checks:int -> ?skip:host * (item -> string) -> string -> host * (item -> string) -> host * (item -> string) -> pipeline
-(** [copy name (h1, src) (h2, dst)] copies with rsync, run on whichever host
-    can reach the other. A destination whose last component contains the
-    item's ID is filled under a temporary name and renamed into place. [skip]
-    names the host its check runs on. *)
+    A stage whose command prints [ferry-set NAME=VALUE] sets a property for
+    the item, usable as [{NAME}] in later stages. *)
 
-val move :
-  ?jobs:int -> ?retries:int -> ?checks:int -> ?skip:host * (item -> string) -> string -> host * (item -> string) -> host * (item -> string) -> pipeline
+type place
+(** A directory on a host. *)
+
+val at : host -> string -> place
+(** [at host dir]: a path template on [host]; it must mention [{id}]. *)
+
+val copy : ?jobs:int -> ?retries:int -> ?ls:string -> string -> place -> stage
+(** [copy name dst] copies the previous output into [dst] with rsync, run on
+    whichever host can reach the other. A destination whose last component
+    contains the item's ID is filled under a temporary name and renamed into
+    place. [dst] is the stage's output. *)
+
+val move : ?jobs:int -> ?retries:int -> ?ls:string -> string -> place -> stage
 (** As {!copy}, then removes the source. *)
 
-val ( >>> ) : pipeline -> pipeline -> pipeline
+val ( >>> ) : stage -> stage -> stage
 (** One after the other. *)
 
-val either : ?capacity:int -> pipeline list -> pipeline
-(** Each item takes one branch: the least loaded one with room whose first
-    stage has a free slot. At most [capacity] items are inside a branch at
-    once (default: no limit). The branches rejoin afterwards, so anything
-    that depends on the branch belongs inside it. *)
+val limit : int -> stage -> stage
+(** [limit n s] lets at most [n] items into [s] at once - a bounded queue
+    before a slow stage, or a budget for a scratch disk. Items wait to enter
+    until [s]'s first stage has a free slot. *)
 
-val limit : int -> pipeline -> pipeline
-(** [limit n p] lets at most [n] items into [p] at once. Items wait to enter
-    until [p]'s first stage has a free slot. *)
+val either : stage list -> stage
+(** Each item takes one branch: the least loaded one whose first stage has a
+    free slot. The branches rejoin afterwards, so anything that depends on
+    the branch belongs inside it; wrap a branch in {!limit} to cap it. *)
 
-type source
-(** Where the items come from, and which are already finished. *)
+val run : pipeline -> unit
+(** Register the pipeline to run. Call it once, at the end of the script. *)
 
-val items : ?on:host -> string -> source
-(** A command printing one item ID per line (run on [on], default {!local}). *)
-
-val done_list : ?on:host -> string -> source -> source
-(** A command, run once at startup, printing IDs that are already finished;
-    those items skip the whole pipeline. *)
-
-val done_if : ?on:host -> (item -> string) -> source -> source
-(** A command run for each new item; exit 0 means it is already finished and
-    skips the whole pipeline. *)
-
-val run : source -> pipeline -> unit
-(** The pipeline to run. Call it once, at the end of the script. *)
+val sprintf : ('a, unit, string) format -> 'a
+(** [Printf.sprintf], for commands that vary per host. *)

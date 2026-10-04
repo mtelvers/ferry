@@ -1,18 +1,19 @@
 (* The scheduler, over a graph built from a [Plan.t].
 
-   Work nodes run a command per item; each has
-     input  - items waiting for their skip check
-     ready  - items waiting for a job slot
-   Gates split the flow into branches and rejoin it. A gate admits an item
-   into a branch only when that branch has fewer than [capacity] items inside
-   and its first stage has a free slot, so the gate's queue - not the first
-   stage's - is where items wait. With several branches, the item goes to the
-   least loaded one, so faster branches take more items.
+   Work nodes run a command per item; each has an input queue of items
+   waiting for a job slot. Gates split the flow into branches and rejoin it.
+   A gate admits an item into a branch only when that branch has fewer than
+   [capacity] items inside and its first stage has a free slot, so the gate's
+   queue - not the first stage's - is where items wait. With several
+   branches, the item goes to the least loaded one, so faster branches take
+   more items.
 
-   Commands, skip checks and paths are functions of the item (its ID, and
-   properties set by earlier stages printing "ferry-set NAME=VALUE").
-   Completed stages are journalled with the item's properties, so a restart
-   resumes each item at the same place - on the same branch. *)
+   Stages declare what they produce. From that follows everything about
+   where an item stands: at startup each output is listed once, and an item
+   starts after the furthest stage whose output exists (or that the journal
+   records as done). A stage that mentions {out} writes there and ferry moves
+   the result into place only on success; a copy's source is the previous
+   output; [consume] deletes it. *)
 
 open Plan
 
@@ -20,16 +21,15 @@ type item = {
   id : string;
   props : (string, string) Hashtbl.t;
   mutable gates : (gate * int) list;  (** gates entered, innermost first *)
+  mutable last : work option;  (** the most recent stage with an output this item passed *)
+  sample : bool;  (** a dry run's stand-in: unknown properties show as <NAME> *)
+  mutable resumed_from : string option;  (** the stage whose listed output placed it, beyond anything journalled *)
 }
-
-and kind =
-  | Check
-  | Run of int
 
 and job = {
   work : work;
   item : item;
-  kind : kind;
+  attempt : int;
   proc : Proc.t;
   started : float;
   log : string Queue.t;
@@ -44,17 +44,16 @@ and work = {
   opts : opts;
   depth : int;
   enclosing : (gate * int) list;
+  prev : work option;  (** the previous stage with an output, when that is fixed *)
   mutable next : node;
   input : item Queue.t;
-  ready : item Queue.t;
   mutable jobs : int;
   mutable paused : bool;
-  mutable checking : job list;
   mutable running : job list;
   mutable retrying : int;
   mutable awaiting : job list;  (** failed attempts waiting to retry *)
   mutable done_ : int;
-  mutable skipped : int;
+  mutable skipped : int;  (** items that passed without running: output found, or journalled *)
   mutable failed : job list;
   recent : job Queue.t;
   durations : float Queue.t;
@@ -84,18 +83,15 @@ type row =
 
 type t = {
   rows : row list;
-  works : work array;
+  works : work array;  (** in flow order *)
   entry : node;
-  source : Plan.source;
   reach : string -> string -> bool;
   journal : out_channel;
   resume : (string, string * (string * string) list) Hashtbl.t;
-  finished_ids : (string, unit) Hashtbl.t;
+  found : (string, int) Hashtbl.t;  (** id -> index of the furthest stage whose output was listed *)
   seen : (string, unit) Hashtbl.t;
   mutable src_proc : Proc.t option;
-  src_err : Unix.file_descr;  (** stderr of the items and done_list commands *)
-  intake : item Queue.t;
-  mutable intake_checks : (item * Proc.t) list;
+  src_err : Unix.file_descr;  (** stderr of the items and listing commands *)
   mutable total : int;
   mutable complete : int;
   mutable earlier : int;
@@ -106,7 +102,6 @@ type t = {
 
 let log_lines = 2000
 let recent_jobs = 50
-let intake_checks = 8
 
 exception Error of string
 
@@ -118,12 +113,20 @@ let parent path =
   let p = strip_slash path in
   match String.rindex_opt p '/' with Some 0 -> "/" | Some i -> String.sub p 0 i | None -> "."
 
+let is_dir p = String.length p > 1 && p.[String.length p - 1] = '/'
 let short h = List.hd (String.split_on_char '.' h)
 let ( let* ) = Result.bind
 
+(* ---- outputs ---- *)
+
+let output_of_step = function Shell { out; _ } -> out | Copy { out; _ } -> Some out | Gate _ -> None
+let where_of_step = function Shell { where; _ } | Copy { where; _ } -> where | Gate _ -> assert false
+let output w = output_of_step w.step
+let has_output w = output w <> None
+
 (* ---- building the graph ---- *)
 
-let new_work step ~depth ~enclosing ~next =
+let new_work step ~depth ~enclosing ~prev ~next =
   let name, opts = match step with Shell { name; opts; _ } | Copy { name; opts; _ } -> (name, opts) | Gate _ -> assert false in
   {
     name;
@@ -132,12 +135,11 @@ let new_work step ~depth ~enclosing ~next =
     opts;
     depth;
     enclosing;
+    prev;
     next;
     input = Queue.create ();
-    ready = Queue.create ();
     jobs = opts.jobs;
     paused = false;
-    checking = [];
     running = [];
     retrying = 0;
     awaiting = [];
@@ -151,17 +153,32 @@ let new_work step ~depth ~enclosing ~next =
     log_oc = stderr;
   }
 
-let rec chain steps ~depth ~enclosing ~next =
+(* Builds back to front, so each node knows its successor; [prev] - the last
+   output-bearing stage before a node - is threaded front to back by
+   building the list of works first. *)
+let rec chain steps ~depth ~enclosing ~prev ~next =
   match steps with
   | [] -> next
   | step :: rest -> (
-      let rest_entry = chain rest ~depth ~enclosing ~next in
       match step with
-      | Shell _ | Copy _ -> Work (new_work step ~depth ~enclosing ~next:rest_entry)
+      | Shell _ | Copy _ ->
+          let w = new_work step ~depth ~enclosing ~prev ~next:Finish in
+          w.next <- chain rest ~depth ~enclosing ~prev:(if has_output w then Some w else prev) ~next;
+          Work w
       | Gate { capacity; branches } ->
-          let g = { capacity; gdepth = depth; entries = [||]; inside = [||]; queue = Queue.create (); after = rest_entry } in
-          g.entries <- Array.of_list (List.mapi (fun i b -> chain b ~depth:(depth + 1) ~enclosing:((g, i) :: enclosing) ~next:(Exit (g, i))) branches);
+          let g = { capacity; gdepth = depth; entries = [||]; inside = [||]; queue = Queue.create (); after = next } in
+          g.entries <- Array.of_list (List.mapi (fun i b -> chain b ~depth:(depth + 1) ~enclosing:((g, i) :: enclosing) ~prev ~next:(Exit (g, i))) branches);
           g.inside <- Array.make (Array.length g.entries) 0;
+          (* after the gate, the previous output depends on the branch taken;
+             the first branch's last output stands in for dry runs and resumes *)
+          let rec last_out node acc =
+            match node with
+            | Work w -> last_out w.next (if has_output w then Some w else acc)
+            | Gate g -> last_out g.after (if Array.length g.entries = 0 then acc else last_out g.entries.(0) acc)
+            | Exit _ | Finish -> acc
+          in
+          let prev' = if Array.length g.entries = 0 then prev else last_out g.entries.(0) prev in
+          g.after <- chain rest ~depth ~enclosing ~prev:prev' ~next;
           Gate g)
 
 let rec rows_of node acc =
@@ -175,50 +192,80 @@ let where_label = function Local -> "local" | At h -> short h
 let work_label w =
   match w.step with
   | Shell { where; _ } -> where_label where
-  | Copy { src = sw, _; dst = dw, _; move; _ } -> Printf.sprintf "%s%s>%s" (where_label sw) (if move then "=" else "-") (where_label dw)
+  | Copy { where; move; _ } -> (
+      match Option.map (fun p -> where_label (where_of_step p.step)) w.prev with
+      | Some src -> Printf.sprintf "%s%s>%s" src (if move then "=" else "-") (where_label where)
+      | None -> (if move then "=>" else "->") ^ where_label where)
   | Gate _ -> ""
 
 let branch_label = function Work w -> work_label w | Gate _ -> "gate" | Exit _ | Finish -> "-"
 
-(* ---- calling the item functions ---- *)
+(* ---- templates for one item ---- *)
 
 let host_of = function At h -> Some h | Local -> None
 
-let view ?out item = { Plan.id = item.id; props = item.props; out }
+let template ?out item s =
+  let missing = ref [] in
+  let r =
+    Plan.subst
+      (fun name ->
+        let v =
+          match name with
+          | "id" -> Some item.id
+          | "out" -> out
+          | _ -> ( match Hashtbl.find_opt item.props name with None when item.sample -> Some ("<" ^ name ^ ">") | v -> v)
+        in
+        if v = None then missing := name :: !missing;
+        v)
+      s
+  in
+  match !missing with
+  | [] -> Ok r
+  | m ->
+      let why =
+        match item.resumed_from with
+        | Some key -> Printf.sprintf " (resumed after %s because its output existed, so properties set by earlier stages are unknown)" key
+        | None -> ""
+      in
+      Error ("unknown variable " ^ String.concat ", " (List.map (fun n -> "{" ^ n ^ "}") (List.rev m)) ^ why)
 
-(* A user function can raise; that fails the job, with the reason as its log. *)
-let call f v = try Ok (f v) with Failure m | Invalid_argument m -> Error m | e -> Error (Printexc.to_string e)
+(* The resolved output of [w] for [item]: host, path, and whether it is a directory. *)
+let output_place w item =
+  match output w with
+  | None -> Result.Error (w.key ^ " has no output")
+  | Some o ->
+      let* p = template item o.path in
+      Ok (where_of_step w.step, strip_slash p, is_dir o.path)
 
+(* What this item brings into [w]: the output of the last stage that had one. *)
+let input_place w item =
+  match item.last with
+  | Some p -> output_place p item
+  | None -> Result.Error (w.key ^ ": no earlier stage declares an output")
+
+let on host cmd = match host with Some h -> Printf.sprintf "ssh -o BatchMode=yes %s %s" h (Filename.quote cmd) | None -> cmd
+let steps l = String.concat " && " (List.filter (( <> ) "") l)
 let remote host path = match host with None -> path | Some h -> h ^ ":" ^ path
 
 (* rsync from (sh, sp) to (dh, dp), run on whichever side can reach the
    other. A per-item destination is filled under a temporary name first. *)
-let copy_script t ~key ~move ~per_item (sh, sp) (dh, dp) =
+let copy_script t ~key ~move ~per_item (sh, sp, sdir) (dh, dp) =
   let target, finish =
     if per_item then
-      let final = strip_slash dp in
-      let tmp = Printf.sprintf "%s/.ferry-%s-%s" (parent final) key (Filename.basename final) in
-      (tmp, Printf.sprintf "rm -rf %s && mv %s %s" final tmp final)
+      let tmp = Printf.sprintf "%s/.ferry-%s-%s" (parent dp) key (Filename.basename dp) in
+      (tmp, Printf.sprintf "rm -rf %s && mv %s %s" dp tmp dp)
     else (dp, "")
   in
+  let src = if sdir then sp ^ "/" else sp in
   let rm_src = if move then " --remove-source-files" else "" in
-  let tidy = Printf.sprintf "{ test ! -d %s || find %s -depth -type d -empty -delete; }" sp sp in
-  let on host cmd = match host with Some h -> Printf.sprintf "ssh -o BatchMode=yes %s %s" h (Filename.quote cmd) | None -> cmd in
-  let steps l = String.concat " && " (List.filter (( <> ) "") l) in
+  let tidy = if move && sdir then Printf.sprintf "{ test ! -d %s || find %s -depth -type d -empty -delete; }" sp sp else "" in
   let pull runner =
-    let tidy = if not move then "" else if sh = runner then tidy else on sh tidy in
-    Ok (runner, steps [ "mkdir -p " ^ parent target; Printf.sprintf "rsync -a%s %s %s" rm_src (if sh = runner then sp else remote sh sp) target; finish; tidy ])
+    let tidy = if tidy = "" || sh = runner then tidy else on sh tidy in
+    Ok (runner, steps [ "mkdir -p " ^ target; Printf.sprintf "rsync -a%s %s %s/" rm_src (if sh = runner then src else remote sh src) target; finish; tidy ])
   in
   let push runner =
-    let rsync_path = Filename.quote (Printf.sprintf "mkdir -p %s && rsync" (parent target)) in
-    Ok
-      ( runner,
-        steps
-          [
-            Printf.sprintf "rsync -a%s --rsync-path=%s %s %s" rm_src rsync_path sp (remote dh target);
-            (if finish = "" then "" else on dh finish);
-            (if move then tidy else "");
-          ] )
+    let rsync_path = Filename.quote (Printf.sprintf "mkdir -p %s && rsync" target) in
+    Ok (runner, steps [ Printf.sprintf "rsync -a%s --rsync-path=%s %s %s/" rm_src rsync_path src (remote dh target); (if finish = "" then "" else on dh finish); tidy ])
   in
   if sh = dh then pull sh
   else
@@ -227,8 +274,6 @@ let copy_script t ~key ~move ~per_item (sh, sp) (dh, dp) =
     | Some _, None -> pull None
     | Some a, Some b -> if t.reach b a then pull dh else if t.reach a b then push sh else Error (Printf.sprintf "neither %s nor %s can ssh to the other" a b)
     | None, None -> assert false
-
-let has_skip w = match w.step with Shell { skip = Some _; _ } | Copy { skip = Some _; _ } -> true | _ -> false
 
 (* A destination is per item - safe to fill under a temporary name and
    rename into place - when its last component contains the item's ID. *)
@@ -239,27 +284,66 @@ let per_item item dp =
   n > 0 && has 0
 
 (* For one item: the host to run on, and the script. *)
-let script t w item kind =
-  match (w.step, kind) with
-  | Shell { where; skip = Some skip; _ }, Check ->
-      let* s = call skip (view item) in
-      Ok (host_of where, s)
-  | Copy { skip = Some (where, skip); _ }, Check ->
-      let* s = call skip (view item) in
-      Ok (host_of where, s)
-  | Shell { where; cmd; atomic = None; _ }, _ ->
-      let* s = call cmd (view item) in
-      Ok (host_of where, s)
-  | Shell { where; cmd; atomic = Some dir; _ }, _ ->
-      let* dir = call dir (view item) in
-      let tmp = Printf.sprintf "%s/.ferry-%s-%s" (parent dir) w.key item.id in
-      let* cmd = call cmd (view ~out:tmp item) in
-      Ok (host_of where, Printf.sprintf "rm -rf %s && mkdir -p %s && (\n%s\n) && mkdir -p %s && mv %s/* %s/ && rmdir %s" tmp tmp cmd dir tmp dir tmp)
-  | Copy { src = sw, sp; dst = dw, dp; move; _ }, _ ->
-      let* sp = call sp (view item) in
-      let* dp = call dp (view item) in
-      copy_script t ~key:w.key ~move ~per_item:(per_item item dp) (host_of sw, sp) (host_of dw, dp)
-  | Gate _, _ -> assert false
+let script t w item =
+  match w.step with
+  | Shell { where; cmd; out; consume; _ } ->
+      let runner = host_of where in
+      let* body =
+        if not (Plan.mentions "out" cmd) then template item cmd
+        else
+          match out with
+          | None -> Result.Error (w.key ^ " mentions {out} but declares no ~out")
+          | Some _ ->
+              let* _, p, dir = output_place w item in
+              let tmp = Printf.sprintf "%s/.ferry-%s-%s" (parent p) w.key item.id in
+              let* cmd = template ~out:tmp item cmd in
+              let place =
+                if dir then Printf.sprintf "mkdir -p %s && rm -rf %s && mv %s %s" (parent p) p tmp p
+                else Printf.sprintf "mkdir -p %s && mv %s/* %s/ && rmdir %s" (parent p) tmp (parent p) tmp
+              in
+              Ok (Printf.sprintf "rm -rf %s && mkdir -p %s && (\n%s\n) && %s" tmp tmp cmd place)
+      in
+      if not consume then Ok (runner, body)
+      else
+        let* ih, ip, _ = input_place w item in
+        let rm = "rm -rf " ^ ip in
+        Ok (runner, Printf.sprintf "(\n%s\n) && %s" body (if host_of ih = runner then rm else on (host_of ih) rm))
+  | Copy { where; move; _ } ->
+      let* sh, sp, sdir = input_place w item in
+      let* _, dp, _ = output_place w item in
+      copy_script t ~key:w.key ~move ~per_item:(per_item item dp) (host_of sh, sp, sdir) (host_of where, dp)
+  | Gate _ -> assert false
+
+(* ---- listing outputs ---- *)
+
+(* A command printing the IDs whose output exists, from the path template:
+   list the first component that mentions {id}, and keep the matches for
+   which the whole path exists. Only templates whose sole variable is {id}
+   can be listed this way. *)
+let derived_ls path =
+  if Plan.vars path <> [ "id" ] then None
+  else
+    let comps = String.split_on_char '/' (strip_slash path) in
+    let rec split before = function
+      | [] -> None
+      | c :: after when Plan.mentions "id" c -> Some (List.rev before, c, after)
+      | c :: after -> split (c :: before) after
+    in
+    match split [] comps with
+    | None -> None
+    | Some (before, comp, after) ->
+        let dir = match String.concat "/" before with "" when before = [ "" ] -> "/" | "" -> "." | d -> d in
+        let var = "{id}" in
+        let rec find from = if String.sub comp from (String.length var) = var then from else find (from + 1) in
+        let rec find_last from = if from < 0 then assert false else if String.sub comp from (String.length var) = var then from else find_last (from - 1) in
+        let i = find 0 and j = find_last (String.length comp - String.length var) in
+        let pre = String.sub comp 0 i and post = String.sub comp (j + 4) (String.length comp - j - 4) in
+        let rest = String.concat "/" (comp :: after) in
+        let full = Plan.subst (function "id" -> Some "$i" | _ -> None) rest in
+        Some
+          (Printf.sprintf "cd %s 2>/dev/null && for f in %s*%s; do i=${f#%s}; i=${i%%%s}; [ -e \"%s\" ] && echo \"$i\"; done; true" dir pre post pre post full)
+
+let ls_of w = match output w with None -> None | Some { ls = Some c; _ } -> Some c | Some { path; ls = None } -> derived_ls path
 
 (* ---- journal ---- *)
 
@@ -290,7 +374,7 @@ let load_journal path =
 
 (* ---- moving items ---- *)
 
-let backlog w = Queue.length w.input + Queue.length w.ready + List.length w.checking + List.length w.running + w.retrying
+let backlog w = Queue.length w.input + List.length w.running + w.retrying
 
 let rec forward t node item =
   match node with
@@ -305,9 +389,9 @@ let rec forward t node item =
 let rec can_accept = function
   | Work w -> (not w.paused) && backlog w < w.jobs
   | Gate g ->
-      let ok = ref false in
-      Array.iteri (fun i e -> if g.inside.(i) < g.capacity && can_accept e then ok := true) g.entries;
-      !ok
+      (* items already waiting at the gate go first *)
+      let rec room i = i < Array.length g.entries && ((g.inside.(i) < g.capacity && can_accept g.entries.(i)) || room (i + 1)) in
+      Queue.is_empty g.queue && room 0
   | Exit _ | Finish -> true
 
 (* leaving the pipeline for good (failed): free the gate places it holds *)
@@ -324,21 +408,20 @@ let time () =
   let tm = Unix.localtime (Unix.gettimeofday ()) in
   Printf.sprintf "%02d:%02d:%02d" tm.tm_hour tm.tm_min tm.tm_sec
 
-let spawn t w item kind =
-  match script t w item kind with
+let spawn t w item attempt =
+  match script t w item with
   | Error msg ->
       (* could not even start: fail it now, with the reason as its log *)
       let now = Unix.gettimeofday () in
-      let job = { work = w; item; kind; proc = Proc.dummy (); started = now; log = Queue.create (); finished = Some (now, 1); cancelled = false } in
+      let job = { work = w; item; attempt; proc = Proc.dummy (); started = now; log = Queue.create (); finished = Some (now, 1); cancelled = false } in
       Queue.push msg job.log;
       Printf.fprintf w.log_oc "%s [%s] %s\n" (time ()) item.id msg;
       w.failed <- job :: List.filter (fun j -> j.item.id <> item.id) w.failed;
       release item;
       t.notify (Printf.sprintf "%s %s: %s" w.key item.id msg)
-  | Ok (runner, script) -> (
-      let tty = match kind with Check -> false | Run _ -> true in
-      let job = { work = w; item; kind; proc = Proc.spawn ~tty runner script; started = Unix.gettimeofday (); log = Queue.create (); finished = None; cancelled = false } in
-      match kind with Check -> w.checking <- job :: w.checking | Run _ -> w.running <- w.running @ [ job ])
+  | Ok (runner, script) ->
+      let job = { work = w; item; attempt; proc = Proc.spawn ~tty:true runner script; started = Unix.gettimeofday (); log = Queue.create (); finished = None; cancelled = false } in
+      w.running <- w.running @ [ job ]
 
 let schedule t =
   List.iter
@@ -357,16 +440,11 @@ let schedule t =
             end
           done
       | Row_work w ->
-          if has_skip w then
-            while List.length w.checking < w.opts.checks && not (Queue.is_empty w.input) do
-              spawn t w (Queue.pop w.input) Check
-            done
-          else Queue.transfer w.input w.ready;
-          while (not w.paused) && List.length w.running < w.jobs && not (Queue.is_empty w.ready) do
-            let item = Queue.pop w.ready in
+          while (not w.paused) && List.length w.running < w.jobs && not (Queue.is_empty w.input) do
+            let item = Queue.pop w.input in
             let attempt = 1 + Option.value ~default:0 (Hashtbl.find_opt w.attempts item.id) in
             Hashtbl.replace w.attempts item.id attempt;
-            spawn t w item (Run attempt)
+            spawn t w item attempt
           done)
     t.rows
 
@@ -374,17 +452,17 @@ let set_prefix = "ferry-set "
 
 let read_job job =
   let w = job.work in
-  let tag = match job.kind with Check -> "check " | Run _ -> "" in
   Proc.read job.proc (fun line ->
       push_bounded job.log log_lines line;
-      (match job.kind with
-      | Run _ when String.starts_with ~prefix:set_prefix line -> (
-          let kv = String.trim (String.sub line (String.length set_prefix) (String.length line - String.length set_prefix)) in
-          match String.index_opt kv '=' with
-          | Some i when i > 0 -> Hashtbl.replace job.item.props (String.sub kv 0 i) (String.sub kv (i + 1) (String.length kv - i - 1))
-          | _ -> ())
-      | _ -> ());
-      Printf.fprintf w.log_oc "%s [%s] %s%s\n" (time ()) job.item.id tag line)
+      (if String.starts_with ~prefix:set_prefix line then
+         let kv = String.trim (String.sub line (String.length set_prefix) (String.length line - String.length set_prefix)) in
+         match String.index_opt kv '=' with
+         | Some i when i > 0 -> Hashtbl.replace job.item.props (String.sub kv 0 i) (String.sub kv (i + 1) (String.length kv - i - 1))
+         | _ -> ());
+      Printf.fprintf w.log_oc "%s [%s] %s\n" (time ()) job.item.id line)
+
+let passed w item =
+  if has_output w then item.last <- Some w
 
 let finish t job rc =
   let w = job.work in
@@ -393,77 +471,81 @@ let finish t job rc =
   Proc.close job.proc;
   job.finished <- Some (now, rc);
   let item = job.item in
-  let moved_on status =
-    journal t w status item;
+  w.running <- List.filter (( != ) job) w.running;
+  if job.cancelled then ()
+  else if rc = 0 then begin
+    w.done_ <- w.done_ + 1;
+    push_bounded w.durations 20 (now -. job.started);
+    Queue.push now w.finishes;
+    push_bounded w.recent recent_jobs job;
+    journal t w "done" item;
+    passed w item;
     forward t w.next item
-  in
-  match job.kind with
-  | Check ->
-      w.checking <- List.filter (( != ) job) w.checking;
-      if not job.cancelled then
-        if rc = 0 then begin
-          w.skipped <- w.skipped + 1;
-          moved_on "skip"
-        end
-        else Queue.push item w.ready
-  | Run attempt ->
-      w.running <- List.filter (( != ) job) w.running;
-      if job.cancelled then ()
-      else if rc = 0 then begin
-        w.done_ <- w.done_ + 1;
-        push_bounded w.durations 20 (now -. job.started);
-        Queue.push now w.finishes;
-        push_bounded w.recent recent_jobs job;
-        moved_on "done"
-      end
-      else if attempt <= w.opts.retries then begin
-        w.retrying <- w.retrying + 1;
-        w.awaiting <- job :: w.awaiting;
-        t.timers <- (now +. (15. *. float attempt), w, item) :: t.timers;
-        t.notify (Printf.sprintf "%s %s failed (exit %d), retry %d/%d" w.key item.id rc attempt w.opts.retries)
-      end
-      else begin
-        w.failed <- job :: List.filter (fun j -> j.item.id <> item.id) w.failed;
-        release item;
-        journal t w "fail" item;
-        t.notify (Printf.sprintf "%s %s FAILED (exit %d)" w.key item.id rc)
-      end
+  end
+  else if job.attempt <= w.opts.retries then begin
+    w.retrying <- w.retrying + 1;
+    w.awaiting <- job :: w.awaiting;
+    t.timers <- (now +. (15. *. float job.attempt), w, item) :: t.timers;
+    t.notify (Printf.sprintf "%s %s failed (exit %d), retry %d/%d" w.key item.id rc job.attempt w.opts.retries)
+  end
+  else begin
+    w.failed <- job :: List.filter (fun j -> j.item.id <> item.id) w.failed;
+    release item;
+    journal t w "fail" item;
+    t.notify (Printf.sprintf "%s %s FAILED (exit %d)" w.key item.id rc)
+  end
 
-let jobs t = Array.to_list t.works |> List.concat_map (fun w -> w.checking @ w.running)
+let jobs t = Array.to_list t.works |> List.concat_map (fun w -> w.running)
 
 (* ---- intake ---- *)
 
-let new_item id props =
+let new_item ?(sample = false) id props =
   let h = Hashtbl.create 8 in
   List.iter (fun (k, v) -> Hashtbl.replace h k v) props;
   Hashtbl.replace h "id" id;
-  { id; props = h; gates = [] }
+  { id; props = h; gates = []; last = None; sample; resumed_from = None }
 
-let find_work t key = Array.to_list t.works |> List.find_opt (fun w -> w.key = key)
+let index_of t key = Array.find_index (fun w -> w.key = key) t.works
 
-(* resume where the journal says, or start at the beginning *)
-let admit t item =
-  match Option.bind (Hashtbl.find_opt t.resume item.id) (fun (key, _) -> find_work t key) with
-  | Some { next = Finish; _ } -> t.earlier <- t.earlier + 1
-  | Some w ->
+(* [w'] lies on the path of an item that is at [w]: outside or in the same
+   branches, or in branches the item has left - taking the first branch of
+   a gate as the one it went through. *)
+let on_path w' w =
+  let rec suffix a b = a == b || (match b with _ :: rest -> suffix a rest | [] -> false) in
+  let rec first_branches a = a == w.enclosing || (match a with (_, 0) :: rest -> first_branches rest | _ -> false) in
+  suffix w'.enclosing w.enclosing || first_branches w'.enclosing
+
+(* Start after stage [i] (or at the beginning when [i] < 0). *)
+let admit t item i =
+  if i < 0 then forward t t.entry item
+  else
+    let w = t.works.(i) in
+    Array.iteri (fun k w' -> if k <= i && on_path w' w then w'.skipped <- w'.skipped + 1) t.works;
+    let rec at_end = function Finish -> true | Exit (g, _) -> at_end g.after | Work _ | Gate _ -> false in
+    if at_end w.next then t.earlier <- t.earlier + 1
+    else begin
       item.gates <- w.enclosing;
       reacquire item;
+      item.last <- (if has_output w then Some w else w.prev);
       forward t w.next item
-  | None -> forward t t.entry item
+    end
 
+(* An item starts after the furthest stage that the journal or a listing
+   says is done. *)
 let arrive t id =
   if id <> "" && not (Hashtbl.mem t.seen id) then begin
     Hashtbl.replace t.seen id ();
     t.total <- t.total + 1;
-    if Hashtbl.mem t.finished_ids id then t.earlier <- t.earlier + 1
-    else
-      let journalled = Hashtbl.find_opt t.resume id in
-      let item = new_item id (match journalled with Some (_, p) -> p | None -> []) in
-      if t.source.done_if <> None && journalled = None then Queue.push item t.intake else admit t item
+    let journalled = Hashtbl.find_opt t.resume id in
+    let item = new_item id (match journalled with Some (_, p) -> p | None -> []) in
+    let from_journal = Option.value ~default:(-1) (Option.bind journalled (fun (key, _) -> index_of t key)) in
+    let from_listing = Option.value ~default:(-1) (Hashtbl.find_opt t.found id) in
+    if from_listing > from_journal then item.resumed_from <- Some t.works.(from_listing).key;
+    admit t item (max from_journal from_listing)
   end
 
 let pump_intake t =
-  (match t.src_proc with
+  match t.src_proc with
   | None -> ()
   | Some p -> (
       Proc.read p (fun line -> arrive t (String.trim line));
@@ -473,29 +555,7 @@ let pump_intake t =
           Proc.read p (fun line -> arrive t (String.trim line));
           Proc.close p;
           t.src_proc <- None;
-          if rc <> 0 then t.notify (Printf.sprintf "items command exited %d (see items.log)" rc)));
-  t.intake_checks <-
-    List.filter
-      (fun (item, p) ->
-        Proc.read p ignore;
-        match Proc.poll p with
-        | None -> true
-        | Some rc ->
-            Proc.close p;
-            if rc = 0 then t.earlier <- t.earlier + 1 else admit t item;
-            false)
-      t.intake_checks;
-  match t.source.done_if with
-  | None -> ()
-  | Some (where, cmd) ->
-      while List.length t.intake_checks < intake_checks && not (Queue.is_empty t.intake) do
-        let item = Queue.pop t.intake in
-        match call cmd (view item) with
-        | Ok s -> t.intake_checks <- (item, Proc.spawn (host_of where) s) :: t.intake_checks
-        | Error msg ->
-            t.notify ("done_if: " ^ msg);
-            admit t item
-      done
+          if rc <> 0 then t.notify (Printf.sprintf "items command exited %d (see items.log)" rc))
 
 (* ---- the main step ---- *)
 
@@ -513,25 +573,21 @@ let pump t =
     (fun (_, w, item) ->
       w.retrying <- w.retrying - 1;
       w.awaiting <- List.filter (fun j -> j.item != item) w.awaiting;
-      Queue.push item w.ready)
+      Queue.push item w.input)
     due;
   schedule t;
   Array.iter (fun w -> flush w.log_oc) t.works
 
 let fds t =
   let open_ p = if p.Proc.open_ && not p.Proc.closed then [ p.Proc.fd ] else [] in
-  (match t.src_proc with Some p -> open_ p | None -> []) @ List.concat_map (fun (_, p) -> open_ p) t.intake_checks @ List.concat_map (fun j -> open_ j.proc) (jobs t)
+  (match t.src_proc with Some p -> open_ p | None -> []) @ List.concat_map (fun j -> open_ j.proc) (jobs t)
 
-let finished t =
-  t.src_proc = None && t.timers = [] && Queue.is_empty t.intake && t.intake_checks = []
-  && List.for_all (function Row_work w -> backlog w = 0 | Row_gate g -> Queue.is_empty g.queue) t.rows
-
+let finished t = t.src_proc = None && t.timers = [] && List.for_all (function Row_work w -> backlog w = 0 | Row_gate g -> Queue.is_empty g.queue) t.rows
 let failures t = Array.fold_left (fun n w -> n + List.length w.failed) 0 t.works
 
 (* Kill everything still running; give it a few seconds, then SIGKILL. *)
 let shutdown t =
   Option.iter (fun p -> Proc.kill p) t.src_proc;
-  List.iter (fun (_, p) -> Proc.kill p) t.intake_checks;
   List.iter
     (fun j ->
       j.cancelled <- true;
@@ -568,7 +624,7 @@ let retry_failed w =
     (fun j ->
       Hashtbl.remove w.attempts j.item.id;
       reacquire j.item;
-      Queue.push j.item w.ready)
+      Queue.push j.item w.input)
     (List.rev w.failed);
   w.failed <- []
 
@@ -578,19 +634,8 @@ let retry_at t w item = List.find_map (fun (at, w', i) -> if w' == w && i == ite
 
 let hosts_of (plan : Plan.t) =
   let of_where = function At h -> [ h ] | Local -> [] in
-  let rec of_steps steps =
-    List.concat_map
-      (function
-        | Shell { where; _ } -> of_where where
-        | Copy { src = sw, _; dst = dw, _; skip; _ } -> of_where sw @ of_where dw @ (match skip with Some (w, _) -> of_where w | None -> [])
-        | Gate { branches; _ } -> List.concat_map of_steps branches)
-      steps
-  in
-  of_where (fst plan.source.items)
-  @ List.concat_map (fun (w, _) -> of_where w) plan.source.done_list
-  @ (match plan.source.done_if with Some (w, _) -> of_where w | None -> [])
-  @ of_steps plan.steps
-  |> List.sort_uniq compare
+  let rec of_steps steps = List.concat_map (function Shell { where; _ } | Copy { where; _ } -> of_where where | Gate { branches; _ } -> List.concat_map of_steps branches) steps in
+  of_where (fst plan.items) @ of_steps plan.steps |> List.sort_uniq compare
 
 let run_list ~stderr host cmd add =
   let p = Proc.spawn ~stderr host cmd in
@@ -607,8 +652,8 @@ let run_list ~stderr host cmd add =
   in
   wait ()
 
-let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
-  let entry = chain plan.steps ~depth:0 ~enclosing:[] ~next:Finish in
+let create ?(dry = false) ?(progress = ignore) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
+  let entry = chain plan.steps ~depth:0 ~enclosing:[] ~prev:None ~next:Finish in
   let rows = List.rev (rows_of entry []) in
   let works = List.filter_map (function Row_work w -> Some w | Row_gate _ -> None) rows |> Array.of_list in
   if works = [||] then raise (Error "the pipeline has no stages");
@@ -616,10 +661,12 @@ let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
      for a copy, the destination, else the source, else both, whichever
      tells them apart. Keys appear in file names. *)
   let label_by pick w =
-    match w.step with
-    | Copy { src = sw, _; dst = dw, _; _ } -> (
-        match pick with `Dst -> where_label dw | `Src -> where_label sw | `Both -> where_label sw ^ "-" ^ where_label dw)
-    | _ -> work_label w
+    let dst = where_label (where_of_step w.step) in
+    match (w.step, pick) with
+    | Copy _, `Src | Copy _, `Both -> (
+        let src = match w.prev with Some p -> where_label (where_of_step p.step) | None -> "?" in
+        match pick with `Src -> src | _ -> src ^ "-" ^ dst)
+    | _ -> dst
   in
   let safe = String.map (function ('A' .. 'Z' | 'a' .. 'z' | '0' .. '9' | '_' | '-' | '.' | '@') as c -> c | _ -> '_') in
   Array.iter
@@ -643,16 +690,13 @@ let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
       rows;
       works;
       entry;
-      source = plan.source;
       reach;
       journal = (if dry then open_out "/dev/null" else open_append journal_path);
       resume = (if dry then Hashtbl.create 1 else load_journal journal_path);
-      finished_ids = Hashtbl.create 1024;
+      found = Hashtbl.create 1024;
       seen = Hashtbl.create 1024;
       src_proc = None;
       src_err = (if dry then Unix.openfile "/dev/null" [ Unix.O_WRONLY; Unix.O_CLOEXEC ] 0 else Unix.openfile (Filename.concat state_dir "items.log") [ Unix.O_WRONLY; Unix.O_CREAT; Unix.O_APPEND; Unix.O_CLOEXEC ] 0o644);
-      intake = Queue.create ();
-      intake_checks = [];
       total = 0;
       complete = 0;
       earlier = 0;
@@ -662,21 +706,34 @@ let create ?(dry = false) ~(plan : Plan.t) ~state_dir ~fresh ~reach ~notify () =
     }
   in
   if not dry then begin
-    List.iter
-      (fun (where, cmd) ->
-        let rc = run_list ~stderr:t.src_err (host_of where) cmd (fun l -> Hashtbl.replace t.finished_ids (String.trim l) ()) in
-        if rc <> 0 then raise (Error (Printf.sprintf "done_list command exited %d: %s" rc cmd)))
-      plan.source.done_list;
-    let where, cmd = plan.source.items in
+    Array.iteri
+      (fun i w ->
+        match ls_of w with
+        | None -> ()
+        | Some cmd ->
+            let n = ref 0 in
+            let rc =
+              run_list ~stderr:t.src_err (host_of (where_of_step w.step)) cmd (fun l ->
+                  let id = String.trim l in
+                  if id <> "" then begin
+                    incr n;
+                    if Option.value ~default:(-1) (Hashtbl.find_opt t.found id) < i then Hashtbl.replace t.found id i
+                  end)
+            in
+            progress (Printf.sprintf "%s: %d output(s) found%s" w.key !n (if rc = 0 then "" else Printf.sprintf " (listing exited %d, see items.log)" rc)))
+      works;
+    let where, cmd = plan.items in
     t.src_proc <- Some (Proc.spawn ~stderr:t.src_err (host_of where) cmd)
   end;
   t
 
-(* For --dry-run: the commands each stage would run for a sample item. *)
+(* For --dry-run: what each stage would list and run, for a sample item. *)
 let describe t id =
-  let item = new_item id [] in
+  let item = new_item ~sample:true id [] in
   List.map
     (function
       | Row_gate g -> `Gate g
-      | Row_work w -> `Work (w, script t w item (Run 1), if has_skip w then Some (script t w item Check) else None))
+      | Row_work w ->
+          item.last <- w.prev;
+          `Work (w, ls_of w, script t w item))
     t.rows

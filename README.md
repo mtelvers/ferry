@@ -15,15 +15,13 @@ reported before anything touches a remote host.
 ferry PIPELINE.ml           # run with the TUI
 ferry --no-tui PIPELINE.ml  # progress lines instead (exit 1 if anything failed)
 ferry -n PIPELINE.ml        # check hosts and routes, print the resolved commands
-ferry --fresh PIPELINE.ml   # ignore the journal from earlier runs
+ferry --fresh PIPELINE.ml   # ignore the journal from earlier runs (outputs still count)
 ```
 
 ## A pipeline
 
 ```ocaml
 open Ferry
-
-let sprintf = Printf.sprintf
 
 type gpu = { host : host; scratch : string; chunk : int }
 
@@ -32,52 +30,72 @@ let gpu1 = host "gpu1.example.org"
 let gpus = [ { host = gpu1; scratch = "/scratch/work"; chunk = 1024 };
              { host = host "gpu2.example.org"; scratch = "/data/work"; chunk = 64 } ]
 
-let build = shell "build" builder ~jobs:4 (fun i -> sprintf "python3 build_tile.py %s /data/%s" (id i) (id i))
-let fetch g = move "fetch" (builder, fun i -> sprintf "/data/%s/" (id i)) (g.host, fun i -> sprintf "%s/%s/" g.scratch (id i))
+let build = stage "build" builder ~jobs:4 ~out:"/data/{id}/" "python3 build_tile.py {id} {out}"
 
-let encode g =
-  shell "encode" g.host
-    ~atomic:(fun i -> sprintf "%s/out/%s" g.scratch (id i))
-    (fun i -> sprintf "TC_CHUNK=%d encode %s/%s %s" g.chunk g.scratch (id i) (out i))
-
-let store g = move "store" (g.host, fun i -> sprintf "%s/out/%s/" g.scratch (id i)) (gpu1, fun i -> sprintf "~/v2/2017/%s/" (id i))
+(* one GPU's share of the work: at most 8 tiles on its scratch disk at a time *)
+let gpu g =
+  limit 8
+    (move "fetch" (at g.host (g.scratch ^ "/{id}/"))
+     >>> stage "encode" g.host ~consume:true ~out:(g.scratch ^ "/out/{id}/")
+           (sprintf "TC_CHUNK=%d encode %s/{id} {out}" g.chunk g.scratch)
+     >>> move "store" (at gpu1 "~/v2/2017/{id}/"))
 
 let () =
-  run
-    (items ~on:builder "cat ~/work/missing.txt"
-     |> done_if ~on:gpu1 (fun i -> sprintf "test -f ~/v2/2017/%s/%s.npy" (id i) (id i)))
-    (build >>> either ~capacity:8 (List.map (fun g -> fetch g >>> encode g >>> store g) gpus))
+  items builder "cat ~/work/missing.txt"
+  |> build
+  |> either (List.map gpu gpus)
+  |> run
 ```
 
-**Commands are functions of the item** (`item -> string`), run with
-`sh -c` on their host. Anything that differs per host is an ordinary OCaml
-value the function closes over, such as the `gpu` record above, so it's
-type-checked. The item gives you:
-
-- `id i`: the item's ID;
-- `out i`: in an `~atomic` stage's command, the temporary output directory;
-- `prop i "name"`: a value an earlier stage set by printing `ferry-set name=value`.
-
-A function can raise `Failure`; that fails the job, with the message as its log.
+A script is a stream of item IDs piped through stages. Every string is a
+template: `{id}` is the item's ID, `{out}` the stage's temporary output
+directory, and `{NAME}` a property an earlier stage set by printing
+`ferry-set NAME=VALUE`. Anything that differs per host is an ordinary OCaml
+value, such as the `gpu` record above, so it is type-checked; `sprintf` is
+there for commands that vary per host.
 
 | | |
 |---|---|
-| `shell name host cmd` | run `cmd i` per item on `host`. `~jobs` (default 1), `~retries` (2), `~skip` (a check on the same host: exit 0 = already done), `~atomic` (a directory: write to `out i`, moved there on success) |
-| `copy name (h1, src) (h2, dst)` | rsync, run on whichever host can reach the other. A destination whose last component contains the ID is filled under a temporary name and renamed into place. `~skip:(host, check)` names the host its check runs on |
+| `items host cmd` | a command printing one ID per line |
+| `stage name host cmd` | run `cmd` per item on `host`. `~jobs` (default 1), `~retries` (2), `~out` (what it produces, see below), `~ls` (how to list the outputs when `~out` is not a path), `~consume:true` (delete the previous output once done) |
+| `copy name (at host dir)` | rsync the previous output into `dir`, run on whichever host can reach the other; `dir` is this stage's output |
 | `move ...` | copy, then delete the source |
 | `a >>> b` | one after the other |
-| `either ~capacity:n [a; b]` | each item takes one branch: the least loaded one with room whose first stage has a free slot. At most `n` items inside a branch. Branches rejoin afterwards, so anything that depends on the branch belongs inside it |
-| `limit n p` | at most `n` items inside `p` |
-| `items ~on cmd` | a command printing one ID per line |
-| `done_list ~on cmd` | run once at startup: IDs printed are finished and skip the pipeline |
-| `done_if ~on check` | run per new item: exit 0 means finished, so it skips the pipeline |
+| `limit n s` | at most `n` items inside `s`: a bounded queue before a slow stage, or a budget for a scratch disk |
+| `either [a; b]` | each item takes one branch: the least loaded one whose first stage has a free slot. Branches rejoin afterwards, so anything that depends on the branch belongs inside it |
+| `run` | ends the pipeline |
+
+## Declared outputs
+
+A stage says what it produces for an item with `~out`, a path on its host
+that mentions `{id}`. A trailing slash means a directory; otherwise it is a
+file in a shared directory. Everything about where an item stands follows
+from that, so scripts never spell out skip checks, done lists, cleanup
+stages or copy sources:
+
+- **Resume.** At startup each output is listed once (one `ls` per stage, or
+  the `~ls` command for outputs on S3 and the like), and an item starts
+  after the furthest stage whose output exists. Work done outside ferry,
+  before a crash, or by an earlier run is never repeated. The journal in
+  `PIPELINE.state/journal` adds what ferry itself finished, with the
+  item's properties; an item placed by a listing alone has no properties
+  from the stages it skipped.
+- **Atomic results.** A command that mentions `{out}` writes into a
+  temporary directory beside the output. Only if it succeeds is the result
+  moved into place: a directory output is renamed into position; the
+  contents of `{out}` go into a file output's directory. A command that
+  ignores `{out}` writes wherever it writes, and a crash can leave a
+  half-made output that looks finished, as with any shell loop.
+- **Copies.** `copy` and `move` name only a destination. The source is the
+  previous output, wherever the item's branch put it.
+- **Cleanup.** `~consume:true` removes the previous output once the stage
+  has succeeded, on whichever host holds it.
+
+`ferry -n` prints, for every stage, the output, the listing command and the
+command it would run for a sample item.
 
 ## Behaviour
 
-- **Restarts resume.** Each finished stage is recorded in `PIPELINE.state/journal`
-  along with the item's properties, so a restart puts each item back where it
-  stopped, on the same branch. `done_list`/`done_if` cover work done outside
-  ferry. Between them, per-stage `~skip` checks are rarely needed.
 - **Pools balance themselves.** `either` sends each item to a branch with
   room, so a faster GPU takes more items. Stages repeated across branches are
   named by host (`encode@gpu1`, `encode@gpu2`) and can be paused alone.
@@ -101,26 +119,6 @@ A function can raise `Failure`; that fails the job, with the message as its log.
 | r | retry the selected stage's failed items |
 | PgUp PgDn End | scroll the log |
 | q | stop all jobs and quit |
-
-## The line format
-
-For a straight pipeline you can skip OCaml. A file not ending in `.ml` is read
-as one stage per block, using `{id}` templates (`{out}` in atomic stages, and
-properties by name). A copy's `skip:` runs on its destination host:
-
-```
-set P = builder.example.org
-items @{P}: cat ~/tiles.txt
-
-stage build @{P} jobs=4 ahead=40
-  skip: test -d /data/{id}
-  run: cd ~/work && python3 build.py {id} /data/{id}
-
-move fetch {P}:/data/{id}/ -> gpu1.example.org:/scratch/{id}/ jobs=2
-```
-
-`ahead=N` is `limit N` around that stage and the next one. See
-`examples/*.ferry`, and `examples/*.ml` for the same pipelines in OCaml.
 
 ## Building
 

@@ -30,9 +30,7 @@ let load_ml path =
   if not (Toploop.use_silently Format.err_formatter (Toploop.File path)) then Error "the script failed (see above)"
   else match !Plan.registered with Some plan -> Ok plan | None -> Error "the script did not call Ferry.run"
 
-let load path =
-  if Filename.check_suffix path ".ml" then load_ml path
-  else match Spec.parse_file path with plan -> Ok (Plan.of_spec plan) | exception Spec.Error e -> Error e
+let load path = load_ml path
 
 (* ---- hosts ---- *)
 
@@ -82,14 +80,17 @@ let dry_run (eng : Engine.t) =
           Printf.printf "\n%s%s capacity=%s: %d branch(es)\n" (String.make (2 * g.gdepth) ' ') (Tui.gate_name g)
             (if g.capacity = max_int then "unlimited" else string_of_int g.capacity)
             (Array.length g.entries)
-      | `Work ((w : Engine.work), run, skip) ->
+      | `Work ((w : Engine.work), ls, run) ->
           let pad = String.make (2 * w.depth) ' ' in
           let show label = function
             | Ok (runner, s) -> Printf.printf "%s-- %s on %s:\n%s%s\n" pad label (Option.value ~default:"local" runner) pad (String.concat ("\n" ^ pad) (String.split_on_char '\n' s))
             | Error e -> Printf.printf "%s-- %s: %s\n" pad label e
           in
           Printf.printf "\n%s== %s  jobs=%d retries=%d\n" pad w.key w.jobs w.opts.retries;
-          Option.iter (show "skip") skip;
+          (match Engine.output w with
+          | Some o -> Printf.printf "%s-- out: %s%s\n" pad o.path (if ls = None then "  (not listable: resumes from the journal only)" else "")
+          | None -> ());
+          Option.iter (fun c -> show "list" (Ok (Engine.host_of (Engine.where_of_step w.step), c))) ls;
           show "run" run)
     (Engine.describe eng "<id>")
 
@@ -164,7 +165,8 @@ let main path state_dir fresh no_tui dry =
       let state_dir = Option.value state_dir ~default:(path ^ ".state") in
       let ui = Tui.create (Filename.basename path) in
       let notify msg = if no_tui then Printf.printf "%s %s\n%!" (Engine.time ()) msg else ui.message <- msg in
-      match Engine.create ~dry ~plan ~state_dir ~fresh ~reach ~notify () with
+      let progress msg = Printf.printf "%s\n%!" msg in
+      match Engine.create ~dry ~progress ~plan ~state_dir ~fresh ~reach ~notify () with
       | exception Engine.Error e ->
           Printf.eprintf "%s: %s\n" path e;
           2
@@ -181,7 +183,7 @@ let main path state_dir fresh no_tui dry =
 
 open Cmdliner
 
-let path = Arg.(required & pos 0 (some file) None & info [] ~docv:"PIPELINE" ~doc:"An OCaml pipeline script (.ml) or a spec file.")
+let path = Arg.(required & pos 0 (some file) None & info [] ~docv:"PIPELINE" ~doc:"An OCaml pipeline script.")
 
 let state_dir =
   Arg.(value & opt (some string) None & info [ "state" ] ~docv:"DIR" ~doc:"Directory for the journal and per-stage logs (default PIPELINE.state).")
