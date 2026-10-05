@@ -1,4 +1,4 @@
-(* The build-and-pool shape with two GPUs, as a dry run: repeated stage names must
+(* A build host, a pool of two GPUs and a copy after it, as a dry run: repeated stage names must
    get distinct keys, and a copy after a pool must take its source from the
    pool's last output, not from the stage before the pool. *)
 open Ferry
@@ -6,17 +6,17 @@ open Ferry
 type gpu = { host : host; scratch : string }
 
 let builder = host "builder.example"
-let gpu1 = host "gpu1.example"
-let gpus = [ { host = gpu1; scratch = "/scratch/a" }; { host = host "gpu2.example"; scratch = "/data/a" } ]
-let build = stage "build" builder ~out:"/data/work/{id}/" "build {id} {out}"
+let store = host "store.example"
+let gpus = [ { host = host "gpu1.example"; scratch = "/scratch/a" }; { host = host "gpu2.example"; scratch = "/data/a" } ]
+let build = stage "build" builder ~out:"/data/built/{id}/" "build {id} {out}"
 
 let gpu g =
   limit 8
     (move "fetch" (at g.host (g.scratch ^ "/{id}/"))
     >>> stage "encode" g.host ~consume:true ~out:(g.scratch ^ "/out/{id}/") "encode {id} {out}"
-    >>> move "store" (at gpu1 "~/v2/{id}/"))
+    >>> move "store" (at store "~/results/{id}/"))
 
-let () = items builder "cat tiles" |> build |> either (List.map gpu gpus) |> copy "ship" (at builder "/data/work/out/{id}/") |> run
+let () = items builder "cat todo" |> build |> either (List.map gpu gpus) |> copy "ship" (at builder "/data/shipped/{id}/") |> run
 
 let () =
   let plan = Option.get !Ferry_core.Plan.registered in
@@ -29,7 +29,7 @@ let () =
     |> Option.get
   in
   let contains s sub = let n = String.length sub in let rec go i = i + n <= String.length s && (String.sub s i n = sub || go (i + 1)) in go 0 in
-  assert (contains ship "rsync -a gpu1.example:~/v2/T/ ");
+  assert (contains ship "rsync -a store.example:~/results/T/ ");
   (* outputs shared between items are refused *)
   let refused f = match f () with exception Invalid_argument _ -> true | _ -> false in
   assert (refused (fun () -> stage "x" builder ~out:"/shared/" "true"));

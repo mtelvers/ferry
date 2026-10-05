@@ -26,22 +26,22 @@ open Ferry
 type gpu = { host : host; scratch : string; chunk : int }
 
 let builder = host "builder.example.org"
-let gpu1 = host "gpu1.example.org"
-let gpus = [ { host = gpu1; scratch = "/scratch/work"; chunk = 1024 };
+let store = host "store.example.org"
+let gpus = [ { host = host "gpu1.example.org"; scratch = "/scratch/work"; chunk = 1024 };
              { host = host "gpu2.example.org"; scratch = "/data/work"; chunk = 64 } ]
 
-let build = stage "build" builder ~jobs:4 ~out:"/data/{id}/" "python3 build_tile.py {id} {out}"
+let build = stage "build" builder ~jobs:4 ~out:"/data/{id}/" "./build.sh {id} {out}"
 
-(* one GPU's share of the work: at most 8 tiles on its scratch disk at a time *)
+(* one GPU's share of the work: at most 8 items on its scratch disk at a time *)
 let gpu g =
   limit 8
     (move "fetch" (at g.host (g.scratch ^ "/{id}/"))
      >>> stage "encode" g.host ~consume:true ~out:(g.scratch ^ "/out/{id}/")
-           (sprintf "TC_CHUNK=%d encode %s/{id} {out}" g.chunk g.scratch)
-     >>> move "store" (at gpu1 "~/v2/2017/{id}/"))
+           (sprintf "CHUNK=%d ./encode.sh %s/{id} {out}" g.chunk g.scratch)
+     >>> move "store" (at store "/srv/results/{id}/"))
 
 let () =
-  items builder "cat ~/work/missing.txt"
+  items builder "cat ~/todo.txt"
   |> build
   |> either (List.map gpu gpus)
   |> run
